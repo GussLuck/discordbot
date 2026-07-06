@@ -75,6 +75,17 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shop_roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            role_id INTEGER,
+            price INTEGER,
+            UNIQUE(guild_id, role_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -100,6 +111,27 @@ def add_balance(user_id: int, guild_id: int, amount: int):
     )
     conn.commit()
     conn.close()
+
+
+def spend_balance(user_id: int, guild_id: int, amount: int) -> bool:
+    ensure_user(user_id, guild_id)
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT balance FROM users WHERE user_id = ? AND guild_id = ?",
+        (user_id, guild_id),
+    )
+    balance = cur.fetchone()[0]
+    if balance < amount:
+        conn.close()
+        return False
+    cur.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND guild_id = ?",
+        (amount, user_id, guild_id),
+    )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def get_profile(user_id: int, guild_id: int):
@@ -141,6 +173,37 @@ def get_guild_config(guild_id: int):
         "automod": row[2],
         "anti_link": row[3],
     }
+
+
+def add_shop_role(guild_id: int, role_id: int, price: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO shop_roles (guild_id, role_id, price) VALUES (?, ?, ?)",
+        (guild_id, role_id, price),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_shop_role(guild_id: int, role_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM shop_roles WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
+    conn.commit()
+    conn.close()
+
+
+def get_shop_roles(guild_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role_id, price FROM shop_roles WHERE guild_id = ? ORDER BY price ASC",
+        (guild_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 async def send_log(guild: discord.Guild, text: str):
@@ -187,6 +250,54 @@ class CloseTicketView(discord.ui.View):
         await interaction.channel.delete(delay=3)
 
 
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _check_admin(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await interaction.response.send_message("Este panel solo funciona en servidores.", ephemeral=True)
+            return False
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Necesitas permisos de administrador.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Toggle AutoMod", style=discord.ButtonStyle.blurple, custom_id="admin_toggle_automod")
+    async def toggle_automod(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction):
+            return
+        cfg = get_guild_config(interaction.guild.id)
+        enabled = 0 if cfg["automod"] else 1
+        set_guild_config(interaction.guild.id, "automod_enabled", enabled)
+        await interaction.response.send_message(
+            f"AutoMod {'activado' if enabled else 'desactivado'} desde panel.", ephemeral=True
+        )
+
+    @discord.ui.button(label="Toggle Anti-Link", style=discord.ButtonStyle.blurple, custom_id="admin_toggle_antilink")
+    async def toggle_antilink(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction):
+            return
+        cfg = get_guild_config(interaction.guild.id)
+        enabled = 0 if cfg["anti_link"] else 1
+        set_guild_config(interaction.guild.id, "anti_link_enabled", enabled)
+        await interaction.response.send_message(
+            f"Anti-link {'activado' if enabled else 'desactivado'} desde panel.", ephemeral=True
+        )
+
+    @discord.ui.button(label="Publicar Panel Ticket", style=discord.ButtonStyle.green, custom_id="admin_post_ticket_panel")
+    async def post_ticket_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction):
+            return
+        embed = discord.Embed(
+            title="Soporte",
+            description="Pulsa el boton para abrir un ticket privado con el staff.",
+            color=discord.Color.green(),
+        )
+        await interaction.channel.send(embed=embed, view=TicketView())
+        await interaction.response.send_message("Panel de tickets publicado.", ephemeral=True)
+
+
 @tasks.loop(seconds=30)
 async def reminder_worker():
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -213,6 +324,7 @@ async def on_ready():
         reminder_worker.start()
     bot.add_view(TicketView())
     bot.add_view(CloseTicketView())
+    bot.add_view(AdminPanelView())
     try:
         synced = await bot.tree.sync()
         print(f"{bot.user} conectado. Slash commands sincronizados: {len(synced)}")
@@ -504,6 +616,101 @@ async def slash_status(interaction: discord.Interaction):
     embed.add_field(name="Uptime", value=f"{hours}h {minutes}m {seconds}s", inline=True)
     embed.add_field(name="Servidores", value=str(len(bot.guilds)), inline=True)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="adminpanel", description="Publica un panel de administracion con botones")
+@app_commands.default_permissions(administrator=True)
+async def slash_admin_panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Panel Admin",
+        description="Usa estos botones para activar funciones sin escribir comandos.",
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, view=AdminPanelView())
+
+
+@bot.tree.command(name="shop_addrole", description="Agrega o actualiza un rol en la tienda")
+@app_commands.default_permissions(administrator=True)
+async def slash_shop_addrole(
+    interaction: discord.Interaction,
+    rol: discord.Role,
+    precio: app_commands.Range[int, 1, 1000000],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Este comando solo funciona en servidores.", ephemeral=True)
+        return
+    add_shop_role(interaction.guild.id, rol.id, precio)
+    await interaction.response.send_message(f"Rol {rol.mention} agregado a la tienda por {precio} monedas.")
+
+
+@bot.tree.command(name="shop_removerole", description="Quita un rol de la tienda")
+@app_commands.default_permissions(administrator=True)
+async def slash_shop_remove_role(interaction: discord.Interaction, rol: discord.Role):
+    if interaction.guild is None:
+        await interaction.response.send_message("Este comando solo funciona en servidores.", ephemeral=True)
+        return
+    remove_shop_role(interaction.guild.id, rol.id)
+    await interaction.response.send_message(f"Rol {rol.mention} eliminado de la tienda.")
+
+
+@bot.tree.command(name="shop", description="Muestra la tienda de roles")
+async def slash_shop(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Este comando solo funciona en servidores.", ephemeral=True)
+        return
+    rows = get_shop_roles(interaction.guild.id)
+    if not rows:
+        await interaction.response.send_message("La tienda esta vacia. Un admin debe cargar roles.")
+        return
+
+    embed = discord.Embed(title="Tienda de Roles", color=discord.Color.gold())
+    for role_id, price in rows[:25]:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            embed.add_field(name=role.name, value=f"Precio: {price} monedas", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="buyrole", description="Compra un rol de la tienda")
+async def slash_buy_role(interaction: discord.Interaction, rol: discord.Role):
+    if interaction.guild is None:
+        await interaction.response.send_message("Este comando solo funciona en servidores.", ephemeral=True)
+        return
+
+    rows = get_shop_roles(interaction.guild.id)
+    price = None
+    for role_id, item_price in rows:
+        if role_id == rol.id:
+            price = item_price
+            break
+
+    if price is None:
+        await interaction.response.send_message("Ese rol no esta en la tienda.", ephemeral=True)
+        return
+
+    if rol in interaction.user.roles:
+        await interaction.response.send_message("Ya tienes ese rol.", ephemeral=True)
+        return
+
+    if interaction.guild.me is not None and rol >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "No puedo asignar ese rol porque esta por encima de mi rol mas alto.",
+            ephemeral=True,
+        )
+        return
+
+    if not spend_balance(interaction.user.id, interaction.guild.id, price):
+        await interaction.response.send_message("No tienes monedas suficientes.", ephemeral=True)
+        return
+
+    try:
+        await interaction.user.add_roles(rol, reason="Compra en tienda")
+    except discord.Forbidden:
+        add_balance(interaction.user.id, interaction.guild.id, price)
+        await interaction.response.send_message("No tengo permisos para asignar ese rol.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"Compra completada: obtuviste {rol.mention} por {price} monedas.")
 
 
 @bot.event
