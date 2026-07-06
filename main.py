@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+SYNC_GUILD_IDS = os.getenv("SYNC_GUILD_IDS", "")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -326,8 +327,19 @@ async def on_ready():
     bot.add_view(CloseTicketView())
     bot.add_view(AdminPanelView())
     try:
-        synced = await bot.tree.sync()
-        print(f"{bot.user} conectado. Slash commands sincronizados: {len(synced)}")
+        guild_ids = [int(x.strip()) for x in SYNC_GUILD_IDS.split(",") if x.strip().isdigit()]
+        if guild_ids:
+            total = 0
+            for guild_id in guild_ids:
+                guild_obj = discord.Object(id=guild_id)
+                bot.tree.copy_global_to(guild=guild_obj)
+                synced = await bot.tree.sync(guild=guild_obj)
+                total += len(synced)
+                print(f"Slash commands sincronizados en guild {guild_id}: {len(synced)}")
+            print(f"{bot.user} conectado. Total sincronizado en guilds: {total}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"{bot.user} conectado. Slash commands globales sincronizados: {len(synced)}")
     except Exception as exc:
         print(f"Error sincronizando comandos: {exc}")
 
